@@ -3,6 +3,7 @@ import { Plus, Trash2, ArrowUp, ArrowDown, Brain, AlertTriangle, Check, Inbox, A
 
 const STORAGE_KEY = 'mlops-brain-v2';
 const LAST_DASHBOARD_KEY = 'mlops-brain-last-dashboard';
+const REVIEW_STORAGE_KEY = 'mlops-brain-review-v1';
 
 const CATEGORIES = {
   deep: {
@@ -49,6 +50,13 @@ const SORT_OPTIONS = {
   effort: 'Mayor esfuerzo',
   time: 'Menor tiempo',
   target: 'Fecha objetivo',
+};
+
+const REVIEW_RATINGS = {
+  again: { label: 'Otra vez', days: 0, accent: '#c15f3c' },
+  hard: { label: 'Dificil', days: 1, accent: '#8a7a66' },
+  good: { label: 'Bien', days: 3, accent: '#6f7358' },
+  easy: { label: 'Facil', days: 7, accent: '#5f7f69' },
 };
 
 const C = {
@@ -148,6 +156,85 @@ function sortTopics(topics, sortMode) {
   });
 }
 
+function getDayStartTime(iso = new Date().toISOString()) {
+  const date = new Date(iso);
+  date.setHours(0, 0, 0, 0);
+  return date.getTime();
+}
+
+function addDaysIso(days) {
+  const date = new Date();
+  date.setDate(date.getDate() + days);
+  date.setHours(8, 0, 0, 0);
+  return date.toISOString();
+}
+
+function normalizeReviewItem(item) {
+  const createdAt = item.createdAt || new Date().toISOString();
+  return {
+    id: item.id || `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    prompt: item.prompt || item.title || '',
+    answer: item.answer || '',
+    sourceTopicId: item.sourceTopicId || '',
+    createdAt,
+    dueAt: item.dueAt || createdAt,
+    lastReviewedAt: item.lastReviewedAt || '',
+    intervalDays: Number.isFinite(Number(item.intervalDays)) ? Number(item.intervalDays) : 0,
+    repetitions: Number.isFinite(Number(item.repetitions)) ? Number(item.repetitions) : 0,
+    lapses: Number.isFinite(Number(item.lapses)) ? Number(item.lapses) : 0,
+  };
+}
+
+function createReviewItem({ prompt, answer = '', sourceTopicId = '' }) {
+  const now = new Date().toISOString();
+  return normalizeReviewItem({
+    id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    prompt: prompt.trim(),
+    answer: answer.trim(),
+    sourceTopicId,
+    createdAt: now,
+    dueAt: now,
+  });
+}
+
+function getReviewDueLabel(item) {
+  const today = getDayStartTime();
+  const due = getDayStartTime(item.dueAt);
+  const diff = Math.round((due - today) / (1000 * 60 * 60 * 24));
+  if (diff < 0) return `Atrasado ${Math.abs(diff)}d`;
+  if (diff === 0) return 'Hoy';
+  if (diff === 1) return 'Manana';
+  return `En ${diff}d`;
+}
+
+function sortReviewItems(items) {
+  return [...items].sort((a, b) => {
+    const dueDiff = new Date(a.dueAt).getTime() - new Date(b.dueAt).getTime();
+    if (dueDiff !== 0) return dueDiff;
+    return new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime();
+  });
+}
+
+function scheduleReviewItem(item, rating) {
+  const currentInterval = Number(item.intervalDays) || 0;
+  const nextInterval = rating === 'again'
+    ? 0
+    : rating === 'hard'
+      ? Math.max(1, Math.round(currentInterval * 1.2) || REVIEW_RATINGS.hard.days)
+      : rating === 'good'
+        ? Math.max(REVIEW_RATINGS.good.days, Math.round(currentInterval * 2) || REVIEW_RATINGS.good.days)
+        : Math.max(REVIEW_RATINGS.easy.days, Math.round(currentInterval * 2.7) || REVIEW_RATINGS.easy.days);
+
+  return {
+    ...item,
+    lastReviewedAt: new Date().toISOString(),
+    dueAt: addDaysIso(nextInterval),
+    intervalDays: nextInterval,
+    repetitions: rating === 'again' ? 0 : (Number(item.repetitions) || 0) + 1,
+    lapses: rating === 'again' ? (Number(item.lapses) || 0) + 1 : Number(item.lapses) || 0,
+  };
+}
+
 export default function CerebroMLOps() {
   const [topics, setTopics] = useState([]);
   const [input, setInput] = useState('');
@@ -163,6 +250,7 @@ export default function CerebroMLOps() {
   const [timerSeconds, setTimerSeconds] = useState(FOCUS_SECONDS);
   const [timerRunning, setTimerRunning] = useState(false);
   const [lastCapturedId, setLastCapturedId] = useState(null);
+  const [reviewItems, setReviewItems] = useState([]);
   const inputRef = useRef(null);
   const backupInputRef = useRef(null);
   const doneSectionRef = useRef(null);
@@ -181,6 +269,11 @@ export default function CerebroMLOps() {
         const dashboardResult = await window.storage.get(LAST_DASHBOARD_KEY);
         if (dashboardResult && dashboardResult.value) {
           setLastCapturedId(dashboardResult.value);
+        }
+        const reviewResult = await window.storage.get(REVIEW_STORAGE_KEY);
+        if (reviewResult && reviewResult.value) {
+          const loadedReviews = JSON.parse(reviewResult.value);
+          if (Array.isArray(loadedReviews)) setReviewItems(loadedReviews.map(normalizeReviewItem));
         }
       } catch (e) {
         // empty state
@@ -211,6 +304,17 @@ export default function CerebroMLOps() {
       }
     })();
   }, [lastCapturedId, loading]);
+
+  useEffect(() => {
+    if (loading) return;
+    (async () => {
+      try {
+        await window.storage.set(REVIEW_STORAGE_KEY, JSON.stringify(reviewItems));
+      } catch (e) {
+        console.error('Review storage failed', e);
+      }
+    })();
+  }, [reviewItems, loading]);
 
   useEffect(() => {
     if (!timerRunning) return undefined;
@@ -438,6 +542,58 @@ export default function CerebroMLOps() {
 
     moveTopic(topicId, categoryKey);
     showToast(`Clasificado en ${CATEGORIES[categoryKey].label}.`);
+  };
+
+  const addReviewItem = ({ prompt, answer, sourceTopicId }) => {
+    const clean = prompt.trim();
+    if (!clean) return;
+    setReviewItems((items) => [createReviewItem({ prompt: clean, answer, sourceTopicId }), ...items]);
+    showToast('Tema agregado a Repaso.');
+  };
+
+  const addTopicToReview = (topicId) => {
+    const topic = topics.find((item) => item.id === topicId);
+    if (!topic) return;
+    const alreadyExists = reviewItems.some((item) => item.sourceTopicId === topicId);
+    if (alreadyExists) {
+      showToast('Ese tema ya esta en Repaso.');
+      return;
+    }
+    addReviewItem({
+      prompt: topic.title,
+      answer: (topic.subtasks || []).map((subtask) => subtask.text).join('\n'),
+      sourceTopicId: topic.id,
+    });
+  };
+
+  const rateReviewItem = (itemId, rating) => {
+    setReviewItems((items) =>
+      items.map((item) => (item.id === itemId ? scheduleReviewItem(item, rating) : item))
+    );
+    showToast(`Repaso programado: ${REVIEW_RATINGS[rating].label}.`);
+  };
+
+  const resetReviewItem = (itemId) => {
+    setReviewItems((items) =>
+      items.map((item) =>
+        item.id === itemId
+          ? {
+              ...item,
+              dueAt: new Date().toISOString(),
+              intervalDays: 0,
+              repetitions: 0,
+              lapses: 0,
+              lastReviewedAt: '',
+            }
+          : item
+      )
+    );
+    showToast('Repaso reiniciado.');
+  };
+
+  const deleteReviewItem = (itemId) => {
+    setReviewItems((items) => items.filter((item) => item.id !== itemId));
+    showToast('Repaso eliminado.');
   };
 
   const updateTopicPlanning = (topicId, updates) => {
@@ -1090,6 +1246,16 @@ export default function CerebroMLOps() {
             <p>Empieza capturando eso que te ronda desde hace días.</p>
           </div>
         )}
+
+        <ReviewSection
+          topics={topics}
+          reviewItems={reviewItems}
+          onAddReviewItem={addReviewItem}
+          onAddTopicToReview={addTopicToReview}
+          onRateReviewItem={rateReviewItem}
+          onResetReviewItem={resetReviewItem}
+          onDeleteReviewItem={deleteReviewItem}
+        />
 
         <BrainDepthMap topics={topics} />
         <TopicGraphMap topics={topics} />
@@ -2879,6 +3045,527 @@ function IconButton({ children, onClick, title, danger, done }) {
     >
       {children}
     </button>
+  );
+}
+
+function ReviewSection({
+  topics,
+  reviewItems,
+  onAddReviewItem,
+  onAddTopicToReview,
+  onRateReviewItem,
+  onResetReviewItem,
+  onDeleteReviewItem,
+}) {
+  const [prompt, setPrompt] = useState('');
+  const [answer, setAnswer] = useState('');
+  const [selectedTopicId, setSelectedTopicId] = useState('');
+  const [showAnswer, setShowAnswer] = useState(false);
+  const sortedItems = sortReviewItems(reviewItems);
+  const dueItems = sortedItems.filter((item) => getDayStartTime(item.dueAt) <= getDayStartTime());
+  const activeItem = dueItems[0] || sortedItems[0] || null;
+  const importedTopicIds = new Set(reviewItems.map((item) => item.sourceTopicId).filter(Boolean));
+  const topicOptions = topics.filter((topic) => !importedTopicIds.has(topic.id));
+  const completedToday = reviewItems.filter(
+    (item) => item.lastReviewedAt && getDayStartTime(item.lastReviewedAt) === getDayStartTime()
+  ).length;
+
+  useEffect(() => {
+    setShowAnswer(false);
+  }, [activeItem?.id]);
+
+  const handleAddManual = () => {
+    if (!prompt.trim()) return;
+    onAddReviewItem({ prompt, answer });
+    setPrompt('');
+    setAnswer('');
+  };
+
+  const handleImportTopic = () => {
+    if (!selectedTopicId) return;
+    onAddTopicToReview(selectedTopicId);
+    setSelectedTopicId('');
+  };
+
+  const sourceTopic = activeItem?.sourceTopicId
+    ? topics.find((topic) => topic.id === activeItem.sourceTopicId)
+    : null;
+
+  return (
+    <section
+      style={{
+        marginTop: 52,
+        background: C.surface,
+        border: `1px solid ${C.line}`,
+        borderRadius: 3,
+        padding: 24,
+        boxShadow: '0 1px 2px rgba(42, 37, 32, 0.03)',
+      }}
+    >
+      <div
+        style={{
+          display: 'flex',
+          alignItems: 'flex-start',
+          justifyContent: 'space-between',
+          gap: 20,
+          marginBottom: 22,
+          flexWrap: 'wrap',
+        }}
+      >
+        <div>
+          <div
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: 10,
+              marginBottom: 8,
+            }}
+          >
+            <BookOpen size={17} color={CATEGORIES.reference.accent} strokeWidth={1.5} />
+            <span
+              style={{
+                fontFamily: '"IBM Plex Mono", monospace',
+                fontSize: 10,
+                letterSpacing: '0.2em',
+                textTransform: 'uppercase',
+                color: C.muted,
+              }}
+            >
+              Repaso espaciado
+            </span>
+          </div>
+          <h2
+            style={{
+              fontFamily: '"Instrument Serif", serif',
+              fontSize: 32,
+              lineHeight: 1.05,
+              fontWeight: 400,
+              margin: 0,
+              color: C.ink,
+              letterSpacing: '-0.015em',
+            }}
+          >
+            Laboratorio de repaso
+          </h2>
+        </div>
+
+        <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+          <MetricPill value={`${dueItems.length} hoy`} accent={CATEGORIES.reference.accent} />
+          <MetricPill value={`${reviewItems.length} tarjetas`} accent={CATEGORIES.reference.accent} muted />
+          <MetricPill value={`${completedToday} repasadas`} accent={CATEGORIES.done.accent} muted />
+        </div>
+      </div>
+
+      <div
+        style={{
+          display: 'grid',
+          gridTemplateColumns: 'repeat(auto-fit, minmax(min(320px, 100%), 1fr))',
+          gap: 22,
+          alignItems: 'start',
+        }}
+      >
+        <div style={{ display: 'grid', gap: 14 }}>
+          <div
+            style={{
+              background: C.surfaceElevated,
+              border: `1px solid ${C.lineSoft}`,
+              borderRadius: 3,
+              padding: 16,
+            }}
+          >
+            <div
+              style={{
+                fontFamily: '"IBM Plex Mono", monospace',
+                fontSize: 10,
+                color: C.muted,
+                textTransform: 'uppercase',
+                letterSpacing: '0.16em',
+                marginBottom: 12,
+              }}
+            >
+              Tema puntual
+            </div>
+            <input
+              value={prompt}
+              onChange={(event) => setPrompt(event.target.value)}
+              placeholder="Pregunta, concepto o tema..."
+              style={{
+                width: '100%',
+                background: C.bg,
+                border: `1px solid ${C.lineSoft}`,
+                borderRadius: 2,
+                padding: '11px 12px',
+                color: C.ink,
+                fontSize: 13,
+                fontFamily: 'inherit',
+                outline: 'none',
+                marginBottom: 10,
+              }}
+            />
+            <textarea
+              value={answer}
+              onChange={(event) => setAnswer(event.target.value)}
+              placeholder="Respuesta breve, pasos o criterios..."
+              rows={4}
+              style={{
+                width: '100%',
+                background: C.bg,
+                border: `1px solid ${C.lineSoft}`,
+                borderRadius: 2,
+                padding: '11px 12px',
+                color: C.ink,
+                fontSize: 13,
+                fontFamily: 'inherit',
+                lineHeight: 1.45,
+                outline: 'none',
+                resize: 'vertical',
+                marginBottom: 12,
+              }}
+            />
+            <button
+              onClick={handleAddManual}
+              disabled={!prompt.trim()}
+              style={{
+                background: prompt.trim() ? CATEGORIES.reference.accent : C.bgAlt,
+                color: prompt.trim() ? C.surface : C.muted,
+                border: 'none',
+                borderRadius: 2,
+                padding: '10px 14px',
+                fontFamily: '"IBM Plex Mono", monospace',
+                fontSize: 10,
+                textTransform: 'uppercase',
+                letterSpacing: '0.14em',
+                display: 'flex',
+                alignItems: 'center',
+                gap: 7,
+                cursor: prompt.trim() ? 'pointer' : 'not-allowed',
+              }}
+            >
+              <Plus size={13} strokeWidth={2} />
+              Agregar repaso
+            </button>
+          </div>
+
+          <div
+            style={{
+              background: C.surfaceElevated,
+              border: `1px solid ${C.lineSoft}`,
+              borderRadius: 3,
+              padding: 16,
+            }}
+          >
+            <div
+              style={{
+                fontFamily: '"IBM Plex Mono", monospace',
+                fontSize: 10,
+                color: C.muted,
+                textTransform: 'uppercase',
+                letterSpacing: '0.16em',
+                marginBottom: 12,
+              }}
+            >
+              Desde temas vistos
+            </div>
+            <div style={{ display: 'flex', gap: 8, alignItems: 'stretch' }}>
+              <select
+                value={selectedTopicId}
+                onChange={(event) => setSelectedTopicId(event.target.value)}
+                title="Seleccionar tema para repaso"
+                style={{
+                  flex: 1,
+                  minWidth: 0,
+                  background: C.bg,
+                  border: `1px solid ${C.lineSoft}`,
+                  borderRadius: 2,
+                  padding: '10px 11px',
+                  color: C.ink,
+                  fontFamily: '"IBM Plex Mono", monospace',
+                  fontSize: 11,
+                  outline: 'none',
+                }}
+              >
+                <option value="">Selecciona un tema</option>
+                {topicOptions.map((topic) => (
+                  <option key={topic.id} value={topic.id}>
+                    {topic.title}
+                  </option>
+                ))}
+              </select>
+              <button
+                onClick={handleImportTopic}
+                disabled={!selectedTopicId}
+                style={{
+                  background: selectedTopicId ? CATEGORIES.deep.accent : C.bgAlt,
+                  color: selectedTopicId ? C.surface : C.muted,
+                  border: 'none',
+                  borderRadius: 2,
+                  padding: '0 14px',
+                  fontFamily: '"IBM Plex Mono", monospace',
+                  fontSize: 10,
+                  textTransform: 'uppercase',
+                  letterSpacing: '0.12em',
+                  cursor: selectedTopicId ? 'pointer' : 'not-allowed',
+                  flexShrink: 0,
+                }}
+              >
+                Pasar
+              </button>
+            </div>
+            <div
+              style={{
+                color: C.muted,
+                fontSize: 12,
+                lineHeight: 1.5,
+                marginTop: 10,
+              }}
+            >
+              Usa esto para repasar temas ya capturados sin moverlos de su columna.
+            </div>
+          </div>
+        </div>
+
+        <div
+          style={{
+            background: C.surfaceElevated,
+            border: `1px solid ${activeItem ? CATEGORIES.reference.accent : C.lineSoft}`,
+            borderRadius: 3,
+            padding: 18,
+            minHeight: 360,
+            boxShadow: activeItem ? `0 0 0 3px ${CATEGORIES.reference.accentSoft}` : 'none',
+          }}
+        >
+          <div
+            style={{
+              fontFamily: '"IBM Plex Mono", monospace',
+              fontSize: 10,
+              color: C.muted,
+              textTransform: 'uppercase',
+              letterSpacing: '0.16em',
+              marginBottom: 14,
+            }}
+          >
+            Tarjeta activa
+          </div>
+
+          {!activeItem ? (
+            <div
+              style={{
+                color: C.muted,
+                fontSize: 13,
+                lineHeight: 1.55,
+                padding: '40px 0',
+                textAlign: 'center',
+              }}
+            >
+              Crea una tarjeta o trae un tema del tablero para empezar.
+            </div>
+          ) : (
+            <>
+              <div
+                style={{
+                  display: 'flex',
+                  gap: 8,
+                  alignItems: 'center',
+                  flexWrap: 'wrap',
+                  marginBottom: 14,
+                }}
+              >
+                <MetricPill value={getReviewDueLabel(activeItem)} accent={CATEGORIES.reference.accent} />
+                <MetricPill value={`${activeItem.intervalDays || 0}d intervalo`} accent={CATEGORIES.reference.accent} muted />
+                <MetricPill value={`${activeItem.repetitions || 0} reps`} accent={CATEGORIES.done.accent} muted />
+              </div>
+
+              <div
+                style={{
+                  fontFamily: '"Instrument Serif", serif',
+                  fontSize: 30,
+                  lineHeight: 1.12,
+                  color: C.ink,
+                  marginBottom: 12,
+                  overflowWrap: 'anywhere',
+                }}
+              >
+                {activeItem.prompt}
+              </div>
+
+              {sourceTopic && (
+                <div
+                  style={{
+                    fontFamily: '"IBM Plex Mono", monospace',
+                    fontSize: 9,
+                    color: (CATEGORIES[sourceTopic.category] || CATEGORIES.backlog).accent,
+                    textTransform: 'uppercase',
+                    letterSpacing: '0.1em',
+                    marginBottom: 14,
+                  }}
+                >
+                  Fuente: {(CATEGORIES[sourceTopic.category] || CATEGORIES.backlog).label}
+                </div>
+              )}
+
+              <div
+                style={{
+                  background: C.bg,
+                  border: `1px solid ${C.lineSoft}`,
+                  borderRadius: 2,
+                  padding: 14,
+                  minHeight: 96,
+                  color: showAnswer ? C.inkSoft : C.muted,
+                  fontSize: 13,
+                  lineHeight: 1.55,
+                  whiteSpace: 'pre-wrap',
+                  marginBottom: 14,
+                }}
+              >
+                {showAnswer
+                  ? activeItem.answer || 'Sin respuesta guardada. Explicalo de memoria y calificate.'
+                  : 'Responde mentalmente antes de revelar.'}
+              </div>
+
+              <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 16 }}>
+                <button
+                  onClick={() => setShowAnswer((value) => !value)}
+                  style={{
+                    background: showAnswer ? C.bgAlt : CATEGORIES.reference.accent,
+                    color: showAnswer ? C.inkSoft : C.surface,
+                    border: 'none',
+                    borderRadius: 2,
+                    padding: '9px 12px',
+                    fontFamily: '"IBM Plex Mono", monospace',
+                    fontSize: 10,
+                    textTransform: 'uppercase',
+                    letterSpacing: '0.12em',
+                  }}
+                >
+                  {showAnswer ? 'Ocultar' : 'Mostrar respuesta'}
+                </button>
+                <button
+                  onClick={() => onResetReviewItem(activeItem.id)}
+                  title="Reiniciar esta tarjeta"
+                  style={{
+                    background: 'transparent',
+                    color: C.inkSoft,
+                    border: `1px solid ${C.line}`,
+                    borderRadius: 2,
+                    width: 36,
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                  }}
+                >
+                  <RotateCcw size={13} strokeWidth={1.8} />
+                </button>
+                <button
+                  onClick={() => onDeleteReviewItem(activeItem.id)}
+                  title="Eliminar repaso"
+                  style={{
+                    background: 'transparent',
+                    color: C.muted,
+                    border: `1px solid ${C.line}`,
+                    borderRadius: 2,
+                    width: 36,
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                  }}
+                >
+                  <Trash2 size={13} strokeWidth={1.8} />
+                </button>
+              </div>
+
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, minmax(0, 1fr))', gap: 7 }}>
+                {Object.entries(REVIEW_RATINGS).map(([key, rating]) => (
+                  <button
+                    key={key}
+                    onClick={() => onRateReviewItem(activeItem.id, key)}
+                    style={{
+                      background: rating.accent,
+                      color: C.surface,
+                      border: 'none',
+                      borderRadius: 2,
+                      padding: '10px 6px',
+                      fontFamily: '"IBM Plex Mono", monospace',
+                      fontSize: 9,
+                      textTransform: 'uppercase',
+                      letterSpacing: '0.08em',
+                      minHeight: 38,
+                    }}
+                  >
+                    {rating.label}
+                  </button>
+                ))}
+              </div>
+            </>
+          )}
+        </div>
+
+        <div
+          style={{
+            background: C.surfaceElevated,
+            border: `1px solid ${C.lineSoft}`,
+            borderRadius: 3,
+            padding: 16,
+          }}
+        >
+          <div
+            style={{
+              fontFamily: '"IBM Plex Mono", monospace',
+              fontSize: 10,
+              color: C.muted,
+              textTransform: 'uppercase',
+              letterSpacing: '0.16em',
+              marginBottom: 12,
+            }}
+          >
+            Proxima cola
+          </div>
+          {sortedItems.length === 0 ? (
+            <div style={{ color: C.muted, fontSize: 13, lineHeight: 1.5 }}>
+              Todavia no hay tarjetas.
+            </div>
+          ) : (
+            <div style={{ display: 'grid', gap: 9 }}>
+              {sortedItems.slice(0, 7).map((item) => (
+                <div
+                  key={item.id}
+                  style={{
+                    display: 'grid',
+                    gridTemplateColumns: 'minmax(0, 1fr) auto',
+                    gap: 10,
+                    paddingBottom: 9,
+                    borderBottom: `1px solid ${C.lineSoft}`,
+                  }}
+                >
+                  <div
+                    title={item.prompt}
+                    style={{
+                      color: C.ink,
+                      fontSize: 13,
+                      whiteSpace: 'nowrap',
+                      overflow: 'hidden',
+                      textOverflow: 'ellipsis',
+                    }}
+                  >
+                    {item.prompt}
+                  </div>
+                  <div
+                    style={{
+                      color: getDayStartTime(item.dueAt) <= getDayStartTime() ? C.accent : C.muted,
+                      fontFamily: '"IBM Plex Mono", monospace',
+                      fontSize: 9,
+                      textTransform: 'uppercase',
+                      letterSpacing: '0.08em',
+                    }}
+                  >
+                    {getReviewDueLabel(item)}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+    </section>
   );
 }
 
